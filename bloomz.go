@@ -1,6 +1,8 @@
 package bloomz
 
 // #cgo LDFLAGS: -lbloomz -lm -lstdc++ -L./
+// #cgo darwin LDFLAGS: -framework Accelerate
+// #cgo darwin CXXFLAGS: -std=c++11
 // #include <bloomz.h>
 import "C"
 import (
