@@ -1,7 +1,7 @@
 #include "ggml.h"
 
 #include "utils.h"
-
+#include "bloomz.h"
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -71,6 +71,16 @@ struct bloom_model {
     //
     struct ggml_context * ctx;
     std::map<std::string, struct ggml_tensor *> tensors;
+};
+
+struct bloomz_state {
+    gpt_vocab vocab;
+    bloom_model model;
+    struct {
+        int64_t t_load_us = -1;
+        int64_t t_sample_us = -1;
+        int64_t t_predict_us = -1;
+    } timing;
 };
 
 // load the model's weights from a file
@@ -770,17 +780,11 @@ bool bloom_eval(
     return true;
 }
 
-int main(int argc, char ** argv) {
-    ggml_time_init();
-    const int64_t t_main_start_us = ggml_time_us();
-
-    gpt_params params;
-    params.model = "models/ggml-model-bloomz-7b1-f16-q4_0.bin";
-    params.prompt = "Je vais";
-
-    if (gpt_params_parse(argc, argv, params) == false) {
-        return 1;
-    }
+int bloomz_predict(void* params_ptr, void* state_pr, char* result) {
+    gpt_params params = *(gpt_params*) params_ptr;
+    bloomz_state state = *(bloomz_state*) state_pr;
+    gpt_vocab vocab = state.vocab;
+    bloom_model model = state.model;
 
     if (params.seed < 0) {
         params.seed = time(NULL);
@@ -789,29 +793,12 @@ int main(int argc, char ** argv) {
     printf("%s: seed = %d\n", __func__, params.seed);
 
     std::mt19937 rng(params.seed);
-    if (params.prompt.empty()) {
-        params.prompt = gpt_random_prompt(rng);
-    }
+
 
 //    params.prompt = R"(// this function checks if the number n is prime
 //bool is_prime(int n) {)";
 
     int64_t t_load_us = 0;
-
-    gpt_vocab vocab;
-    bloom_model model;
-
-    // load the model
-    {
-        const int64_t t_start_us = ggml_time_us();
-        const int n_ctx = 512;
-        if (!bloom_model_load(params.model, model, vocab, n_ctx)) {  // TODO: set context from user input ??
-            fprintf(stderr, "%s: failed to load model from '%s'\n", __func__, params.model.c_str());
-            return 1;
-        }
-
-        t_load_us = ggml_time_us() - t_start_us;
-    }
 
     int n_past = 0;
 
@@ -825,16 +812,6 @@ int main(int argc, char ** argv) {
 
     params.n_predict = std::min(params.n_predict, model.hparams.n_ctx - (int) embd_inp.size());
 
-    printf("\n");
-    printf("%s: prompt: '%s'\n", __func__, params.prompt.c_str());
-    printf("%s: number of tokens in prompt = %zu\n", __func__, embd_inp.size());
-    for (int i = 0; i < (int) embd_inp.size(); i++) {
-        printf("%6d -> '%s'\n", embd_inp[i], vocab.id_to_token.at(embd_inp[i]).c_str());
-    }
-    printf("\n");
-    printf("sampling parameters: temp = %f, top_k = %d, top_p = %f, repeat_last_n = %i, repeat_penalty = %f\n", params.temp, params.top_k, params.top_p, params.repeat_last_n, params.repeat_penalty);
-    printf("\n\n");
-
     std::vector<gpt_vocab::id> embd;
 
     // determine the required inference memory per token:
@@ -844,6 +821,7 @@ int main(int argc, char ** argv) {
     int last_n_size = params.repeat_last_n;
     std::vector<gpt_vocab::id> last_n_tokens(last_n_size);
     std::fill(last_n_tokens.begin(), last_n_tokens.end(), 0);
+    std::string res = "";
 
     for (int i = embd.size(); i < embd_inp.size() + params.n_predict; i++) {
         // predict
@@ -902,9 +880,8 @@ int main(int argc, char ** argv) {
 
         // display text
         for (auto id : embd) {
-            printf("%s", vocab.id_to_token[id].c_str());
+                res += vocab.id_to_token[id].c_str();
         }
-        fflush(stdout);
 
         // end of text token
         if (embd.back() == 2) {
@@ -913,7 +890,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // report timing
+/*
     {
         const int64_t t_main_end_us = ggml_time_us();
 
@@ -922,10 +899,60 @@ int main(int argc, char ** argv) {
         printf("%s:     load time = %8.2f ms\n", __func__, t_load_us/1000.0f);
         printf("%s:   sample time = %8.2f ms\n", __func__, t_sample_us/1000.0f);
         printf("%s:  predict time = %8.2f ms / %.2f ms per token\n", __func__, t_predict_us/1000.0f, t_predict_us/1000.0f/n_past);
-        printf("%s:    total time = %8.2f ms\n", __func__, (t_main_end_us - t_main_start_us)/1000.0f);
     }
+    */
 
-    ggml_free(model.ctx);
+  //  ggml_free(model.ctx);
+    strcpy(result, res.c_str()); 
 
     return 0;
+}
+
+int bloomz_bootstrap(const char *model_path, void* state_pr, int32_t n_ctx, bool f16memory)
+    // load the model
+{
+    ggml_time_init();
+    bloomz_state* state = (bloomz_state*) state_pr;
+
+        
+    const int64_t t_start_us = ggml_time_us();
+    if (!bloom_model_load(model_path, state->model, state->vocab, n_ctx)) {  // TODO: set context from user input ??
+        fprintf(stderr, "%s: failed to load model from '%s'\n", __func__, model_path);
+        return 1;
+    }
+
+    state->timing.t_load_us = ggml_time_us() - t_start_us;
+    return 0;
+}
+
+void* bloomz_allocate_state() {
+    return new bloomz_state;
+}
+
+void* bloomz_allocate_params(const char *prompt, int seed, int threads, int tokens, int top_k,
+                            float top_p, float temp, float repeat_penalty, int repeat_last_n) {
+    gpt_params* params = new gpt_params;
+    params->seed = seed;
+    params->n_threads = threads;
+    params->n_predict = tokens;
+    params->repeat_last_n = repeat_last_n;
+
+    params->top_k = top_k;
+    params->top_p = top_p;
+    params->temp = temp;
+    params->repeat_penalty = repeat_penalty;
+
+    params->prompt = prompt;
+    
+    return params;
+}
+
+void bloomz_free_params(void* params_ptr) {
+    gpt_params* params = (gpt_params*) params_ptr;
+    delete params;
+}
+
+void bloomz_free_model(void* params_ptr) {
+    bloomz_state* params = (bloomz_state*) params_ptr;
+    ggml_free(params->model.ctx);
 }

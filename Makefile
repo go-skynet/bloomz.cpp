@@ -209,3 +209,13 @@ quantize: quantize.cpp ggml.o utils.o
 .PHONY: tests
 tests:
 	bash ./tests/run-tests.sh
+
+bloomz.o: bloomz.cpp ggml.o utils.o
+	$(CXX) $(CXXFLAGS) bloomz.cpp ggml.o utils.o -o bloomz.o -c $(LDFLAGS)
+
+libbloomz.a: bloomz.o ggml.o utils.o
+	ar src libbloomz.a bloomz.o ggml.o utils.o
+	
+llama-go: main.go lama.cpp lama.h
+	CGO_CFLAGS_ALLOW='-mf.*' go build .
+#
